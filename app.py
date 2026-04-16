@@ -160,6 +160,145 @@ def _baseline_uniform_max_plan(
     return {str(row["product"]): float(row["max_demand"]) * scale for _, row in products_df.iterrows()}
 
 
+def _unit_material_cost_per_unit(product: str, bom_df: pd.DataFrame, resources_df: pd.DataFrame) -> float:
+    """True variable procurement $ for one unit of SKU (BOM × unit cost)."""
+    total = 0.0
+    for r in resources_df.index:
+        sub = bom_df.loc[(bom_df["product"] == product) & (bom_df["resource"] == r)]
+        if sub.empty:
+            continue
+        u = float(sub["units_required"].iloc[0])
+        total += u * float(resources_df.loc[r, "unit_cost"])
+    return total
+
+
+def _max_feasible_increment(
+    product: str, rem: pd.Series, bom_df: pd.DataFrame, headroom: float
+) -> float:
+    """Max extra units of `product` without violating remaining capacities or headroom."""
+    caps = [max(0.0, float(headroom))]
+    for r in rem.index:
+        sub = bom_df.loc[(bom_df["product"] == product) & (bom_df["resource"] == r)]
+        if sub.empty:
+            continue
+        u = float(sub["units_required"].iloc[0])
+        if u <= 1e-12:
+            continue
+        caps.append(float(rem[r]) / u)
+    return max(0.0, min(caps))
+
+
+def build_shadow_price_dataframe(sol: dict, resources_work: pd.DataFrame) -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Assemble sensitivity table: shadow price ≈ marginal value of relaxing one unit of RHS
+    (extra capacity) on the optimal LP basis — continuous model only.
+    """
+    if not sol.get("duals_valid", True):
+        return None, (
+            "Shadow prices are reported for the **continuous LP relaxation**. "
+            "Turn off **Integer production quantities** in the sidebar to enable duals."
+        )
+    sp = sol.get("shadow_prices") or {}
+    if not sp:
+        return None, "Solver did not return shadow prices for this run (try continuous variables)."
+
+    rows = []
+    for r in resources_work.index:
+        rs = str(r)
+        used = float(sol["resource_usage"].get(r, sol["resource_usage"].get(rs, 0.0)))
+        avail = float(resources_work.loc[r, "available"])
+        slack = max(0.0, avail - used)
+        util = float(sol["resource_utilization_pct"].get(r, sol["resource_utilization_pct"].get(rs, 0.0)))
+        pi = sp.get(rs)
+        if pi is None:
+            pi = sp.get(r)
+        bind_thr = max(1e-6, 0.002 * max(avail, 1.0))
+        binding = "Tight (slack ≈ 0)" if slack < bind_thr else "Has slack"
+        rows.append(
+            {
+                "Resource": rs,
+                "Shadow price ($ / extra unit of capacity)": pi,
+                "Utilization %": util,
+                "Unused capacity (units)": slack,
+                "Capacity posture": binding,
+            }
+        )
+    df = pd.DataFrame(rows)
+    df["_pi_sort"] = df["Shadow price ($ / extra unit of capacity)"].fillna(0.0)
+    df = df.sort_values("_pi_sort", ascending=False).drop(columns=["_pi_sort"])
+    if df["Shadow price ($ / extra unit of capacity)"].isna().all():
+        return None, "Shadow prices were not exposed by CBC for this model instance."
+    return df, None
+
+
+def compute_naive_greedy_high_cost_bias_plan(
+    products_df: pd.DataFrame, resources_df: pd.DataFrame, bom_df: pd.DataFrame
+) -> dict:
+    """
+    Naïve operational baseline (no LP): satisfy min demand, then repeatedly add volume
+    prioritizing SKUs with the **worst** material economics (highest procurement $ per $ of price).
+
+    Interpretation for stakeholders: analogous to pushing volume through **cost-heavy SKUs first**
+    (a common failure mode if a plant or sourcing lane behaves like a “highest-cost facility”).
+    """
+    rem = resources_df["available"].astype(float).copy()
+    plan: dict[str, float] = {}
+    for _, row in products_df.iterrows():
+        p = str(row["product"])
+        q0 = float(row["min_demand"])
+        plan[p] = q0
+        for r in rem.index:
+            sub = bom_df.loc[(bom_df["product"] == p) & (bom_df["resource"] == r)]
+            if sub.empty:
+                continue
+            rem[r] -= q0 * float(sub["units_required"].iloc[0])
+    if float(rem.min()) < -1e-5:
+        return {"feasible": False, "reason": "Minimum demand exceeds capacity for this scenario."}
+
+    pindex = products_df.set_index("product")
+    prod_rows = []
+    for _, row in products_df.iterrows():
+        p = str(row["product"])
+        price = float(row["price"])
+        umc = _unit_material_cost_per_unit(p, bom_df, resources_df)
+        badness = umc / max(price, 1e-9)
+        prod_rows.append((badness, p, float(row["max_demand"])))
+
+    prod_rows.sort(key=lambda t: t[0], reverse=True)
+    order = [p for _, p, _ in prod_rows]
+
+    max_passes = max(50, len(order) * 80)
+    for _ in range(max_passes):
+        progressed = False
+        for p in order:
+            headroom = float(pindex.loc[p, "max_demand"]) - plan[p]
+            if headroom <= 1e-9:
+                continue
+            d = _max_feasible_increment(p, rem, bom_df, headroom)
+            if d <= 1e-9:
+                continue
+            plan[p] += d
+            for r in rem.index:
+                sub = bom_df.loc[(bom_df["product"] == p) & (bom_df["resource"] == r)]
+                if sub.empty:
+                    continue
+                rem[r] -= d * float(sub["units_required"].iloc[0])
+            progressed = True
+        if not progressed:
+            break
+
+    revenue = _total_revenue_from_plan(plan, products_df)
+    material = _total_material_cost(plan, bom_df, resources_df)
+    profit = revenue - material
+    return {
+        "feasible": True,
+        "plan": plan,
+        "total_revenue": revenue,
+        "total_material_cost": material,
+        "profit": profit,
+    }
+
+
 st.title("Production Planning — LP Optimization Console")
 st.caption(
     "Maximize profit subject to BOM and resource constraints. "
@@ -231,6 +370,8 @@ baseline_plan = _baseline_uniform_max_plan(products_df, resources_work, bom_df, 
 baseline_material = _total_material_cost(baseline_plan, bom_df, resources_work)
 baseline_revenue = _total_revenue_from_plan(baseline_plan, products_df)
 baseline_profit = baseline_revenue - baseline_material
+
+naive_pack = compute_naive_greedy_high_cost_bias_plan(products_df, resources_work, bom_df)
 
 total_demand_units = float(products_df["max_demand"].sum())
 total_capacity_units = float(resources_work["available"].sum())
@@ -323,7 +464,7 @@ with st.expander("Technical methodology & assumptions"):
   subject to BOM consumption and resource availability caps.
 - **Data:** `products` (price, min/max demand), `resources` (availability, unit cost), `bom` (units of resource per product).
 - **Integrality:** Continuous relaxation may overstate feasibility for discrete units; enable integer variables for discrete lots.
-- **Validation:** Compare shadow prices / duals in advanced workflows; this UI surfaces primal plan and utilization only.
+- **Sensitivity:** After a continuous solve, expand **Sensitivity analysis — shadow prices** to see which capacity rows bind hardest on the optimal basis (dual values from CBC).
         """
     )
 
@@ -419,6 +560,49 @@ with k4:
         delta="Bottleneck signal" if avg_util > 85 else "Headroom available",
         delta_color="off",
     )
+
+# --- Naïve baseline vs LP (Prompt 1: scenario delta vs “bad operations”) ---
+st.subheader("Scenario comparison — LP vs naïve baseline")
+st.caption(
+    "**Naïve baseline (no optimizer):** meet **min demand**, then add volume repeatedly, always prioritizing SKUs with the "
+    "**highest procurement cost per dollar of price** — a stand‑in for “push everything through your worst‑economics lane / "
+    "highest‑cost facility behavior.” The **linear program** then maximizes **profit** on the same capacities and BOM."
+)
+if naive_pack.get("feasible"):
+    naive_profit = float(naive_pack["profit"])
+    naive_material = float(naive_pack["total_material_cost"])
+    naive_revenue = float(naive_pack["total_revenue"])
+    profit_lift_naive = float(profit - naive_profit)
+    material_saved_naive = float(naive_material - mat_cost)
+    n1, n2, n3 = st.columns(3)
+    with n1:
+        st.metric(
+            "Naïve baseline profit",
+            f"${naive_profit:,.2f}",
+            help="Greedy plan that favors cost-heavy SKUs first — same capacities & BOM as the LP.",
+        )
+    with n2:
+        st.metric(
+            "Optimized profit (LP)",
+            f"${profit:,.2f}",
+            delta=f"${profit_lift_naive:+,.0f} vs naïve baseline",
+            delta_color="normal" if profit_lift_naive > 1 else ("inverse" if profit_lift_naive < -1 else "off"),
+            help="How much more profit the LP captures versus the naïve greedy baseline.",
+        )
+    with n3:
+        st.metric(
+            "Material spend (LP)",
+            f"${mat_cost:,.2f}",
+            delta=f"${material_saved_naive:+,.0f} vs naïve baseline",
+            delta_color="normal" if material_saved_naive > 1 else ("inverse" if material_saved_naive < -1 else "off"),
+            help="Positive delta means the LP buys less material than the naïve plan (often true, not guaranteed).",
+        )
+    st.caption(
+        f"Naïve baseline realized **${naive_revenue:,.0f}** revenue on **${naive_material:,.0f}** material; "
+        f"LP realized **${revenue:,.0f}** revenue on **${mat_cost:,.0f}** material."
+    )
+else:
+    st.warning(naive_pack.get("reason", "Naïve baseline is infeasible for this scenario (check min demand vs capacity)."))
 
 # --- Scenario comparison: baseline vs optimized material spend ---
 
@@ -662,6 +846,34 @@ with _dl3:
         file_name="resource_utilization.csv",
         mime="text/csv",
     )
+
+with st.expander("Sensitivity analysis — shadow prices (dual values)", expanded=False):
+    st.markdown(
+        """
+**What this means (decision science)**  
+For each resource capacity row (`consumption ≤ available`), the **shadow price** is the **approximate**
+increase in optimal **profit** if you relax that capacity by **one more unit** — holding everything else fixed.
+
+- **Higher shadow price** → that capacity is a **more expensive bottleneck** on the margin (freeing it pays more).
+- **Unused capacity (slack)** → shadow price is typically **~0** (extra units would not change the optimum yet).
+
+Shadow prices come from the **LP dual**; they are most interpretable for the **continuous** formulation.
+        """
+    )
+    sh_df, sh_msg = build_shadow_price_dataframe(sol, resources_work)
+    if sh_msg:
+        st.info(sh_msg)
+    if sh_df is not None:
+        st.dataframe(sh_df, use_container_width=True, hide_index=True)
+        top = sh_df.iloc[0]
+        pi0 = top["Shadow price ($ / extra unit of capacity)"]
+        if pd.notna(pi0) and float(pi0) > 1e-8:
+            st.success(
+                f"**Tightest economic bottleneck (on margin):** **{top['Resource']}** — shadow price "
+                f"**${float(pi0):,.2f}** per extra unit of capacity vs **{top['Capacity posture'].lower()}**."
+            )
+        else:
+            st.caption("No strongly positive shadow prices returned — capacity may be abundant vs demand at this optimum.")
 
 st.divider()
 
