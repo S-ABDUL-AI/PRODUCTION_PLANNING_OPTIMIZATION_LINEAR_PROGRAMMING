@@ -1,3 +1,4 @@
+import io
 import json
 import os
 
@@ -77,6 +78,61 @@ def get_dfs(use_sample, products_file, resources_file, bom_file):
     if not products_file or not resources_file or not bom_file:
         return None, None, None
     return load_data(products_file, resources_file, bom_file)
+
+
+def _total_material_cost(plan: dict, bom_df: pd.DataFrame, resources_df: pd.DataFrame) -> float:
+    """Sum procurement cost for a production mix (same accounting as the LP objective)."""
+    total = 0.0
+    for p, q in plan.items():
+        if q is None:
+            continue
+        qf = float(q)
+        for r in resources_df.index:
+            sub = bom_df.loc[(bom_df["product"] == p) & (bom_df["resource"] == r)]
+            if sub.empty:
+                continue
+            u = float(sub["units_required"].iloc[0])
+            total += qf * u * float(resources_df.loc[r, "unit_cost"])
+    return total
+
+
+def _max_uniform_scale_feasible(products_df: pd.DataFrame, resources_df: pd.DataFrame, bom_df: pd.DataFrame) -> float:
+    """Largest s in [0, 1] such that producing s * max_demand for every SKU stays within resource caps."""
+
+    def feasible(s: float) -> bool:
+        if s <= 0:
+            return True
+        for r in resources_df.index:
+            used = 0.0
+            for _, row in products_df.iterrows():
+                p = row["product"]
+                q = float(row["max_demand"]) * s
+                sub = bom_df.loc[(bom_df["product"] == p) & (bom_df["resource"] == r)]
+                if sub.empty:
+                    continue
+                used += q * float(sub["units_required"].iloc[0])
+            if used > float(resources_df.loc[r, "available"]) + 1e-5:
+                return False
+        return True
+
+    if feasible(1.0):
+        return 1.0
+    if not feasible(1e-9):
+        return 0.0
+    lo, hi = 0.0, 1.0
+    for _ in range(56):
+        mid = (lo + hi) / 2
+        if feasible(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _baseline_uniform_max_plan(
+    products_df: pd.DataFrame, resources_df: pd.DataFrame, bom_df: pd.DataFrame, scale: float
+) -> dict[str, float]:
+    return {str(row["product"]): float(row["max_demand"]) * scale for _, row in products_df.iterrows()}
 
 
 st.title("Production Planning — LP Optimization Console")
@@ -242,6 +298,117 @@ with k4:
         delta="Bottleneck signal" if avg_util > 85 else "Headroom available",
         delta_color="off",
     )
+
+# --- Scenario comparison: baseline vs optimized material spend ---
+baseline_scale = _max_uniform_scale_feasible(products_df, resources_df, bom_df)
+baseline_plan = _baseline_uniform_max_plan(products_df, resources_df, bom_df, baseline_scale)
+baseline_material = _total_material_cost(baseline_plan, bom_df, resources_df)
+if baseline_material > 1e-9:
+    cost_reduction_pct = (baseline_material - mat_cost) / baseline_material * 100.0
+else:
+    cost_reduction_pct = 0.0
+saved_usd = baseline_material - mat_cost
+
+st.subheader("Scenario comparison — material spend")
+st.caption(
+    "Baseline: each SKU at max demand, scaled uniformly by "
+    f"{baseline_scale:.1%} until the mix is resource-feasible (status-quo push scenario). "
+    "Optimized: profit-maximizing LP solution on the same inputs."
+)
+c_sc_a, c_sc_mid, c_sc_b = st.columns([1, 0.55, 1])
+with c_sc_a:
+    st.markdown("##### Baseline costs")
+    st.metric(
+        label="Total material spend",
+        value=f"${baseline_material:,.2f}",
+        help="Procurement cost under the scaled max-demand reference mix.",
+    )
+with c_sc_mid:
+    st.markdown(
+        f"<div style='text-align:center;padding-top:1.6rem;font-size:2rem;color:#0052CC;font-weight:700;'>→</div>",
+        unsafe_allow_html=True,
+    )
+    st.metric(
+        label="Cost vs baseline",
+        value=f"{cost_reduction_pct:+.1f}%",
+        delta=f"${saved_usd:,.2f} material" if abs(saved_usd) > 0.01 else "No change",
+        delta_color="normal" if saved_usd > 0 else ("inverse" if saved_usd < 0 else "off"),
+        help="Positive % = optimized plan uses less material than the baseline push scenario.",
+    )
+with c_sc_b:
+    st.markdown("##### Optimized costs")
+    st.metric(
+        label="Total material spend",
+        value=f"${mat_cost:,.2f}",
+        help="Procurement cost at the optimal production plan.",
+    )
+
+if 12 <= cost_reduction_pct <= 18:
+    st.success(
+        f"**Executive headline:** material spend is down **~{cost_reduction_pct:.0f}%** vs the baseline "
+        "push scenario — in line with common **10–15%** procurement efficiency targets in briefing decks."
+    )
+elif cost_reduction_pct > 0:
+    st.info(
+        f"**Material efficiency:** **{cost_reduction_pct:.1f}%** lower procurement cost than the baseline "
+        f"scenario (~**${saved_usd:,.0f}** saved at this mix)."
+    )
+else:
+    st.warning(
+        "**Material spend:** the profit-optimal plan can **exceed** the naive baseline on procurement "
+        "when revenue upside justifies higher input use — review BOM costs and margins by SKU."
+    )
+
+plan_compare = plan_df.copy()
+plan_compare = plan_compare.rename(columns={"quantity": "optimized_qty"})
+plan_compare["baseline_qty"] = plan_compare["product"].map(baseline_plan).astype(float)
+plan_compare["qty_delta_vs_baseline"] = plan_compare["optimized_qty"] - plan_compare["baseline_qty"]
+
+summary_exec = pd.DataFrame(
+    [
+        {
+            "metric": "Baseline_total_material_USD",
+            "value": round(baseline_material, 2),
+        },
+        {
+            "metric": "Optimized_total_material_USD",
+            "value": round(mat_cost, 2),
+        },
+        {
+            "metric": "Cost_reduction_vs_baseline_pct",
+            "value": round(cost_reduction_pct, 3),
+        },
+        {
+            "metric": "Baseline_max_demand_uniform_scale",
+            "value": round(baseline_scale, 6),
+        },
+        {
+            "metric": "Total_profit_USD",
+            "value": round(profit, 2),
+        },
+        {
+            "metric": "Total_revenue_USD",
+            "value": round(revenue, 2),
+        },
+    ]
+)
+
+buf_exec = io.StringIO()
+buf_exec.write("# EXECUTIVE_REVIEW — scenario snapshot (append to board pack)\n")
+summary_exec.to_csv(buf_exec, index=False)
+buf_exec.write("\n# PRODUCT_PLAN — baseline vs optimized quantities\n")
+plan_compare.to_csv(buf_exec, index=False)
+buf_exec.write("\n# RESOURCE_UTILIZATION\n")
+res_usage_df.to_csv(buf_exec, index=False)
+exec_csv_bytes = buf_exec.getvalue().encode("utf-8")
+
+st.download_button(
+    label="Download executive review (CSV)",
+    data=exec_csv_bytes,
+    file_name="executive_review_supply_chain_scenario.csv",
+    mime="text/csv",
+    help="One file: KPI snapshot, plan comparison (baseline vs optimized qty), and utilization for audit.",
+)
 
 fig1 = go.Figure()
 fig1.add_trace(go.Bar(x=plan_df["product"], y=plan_df["quantity"], marker_color="#0052CC", name="Units"))
