@@ -96,6 +96,19 @@ def _total_material_cost(plan: dict, bom_df: pd.DataFrame, resources_df: pd.Data
     return total
 
 
+def _total_revenue_from_plan(plan: dict, products_df: pd.DataFrame) -> float:
+    """Revenue Σ price_i × q_i for a quantity vector."""
+    pid = products_df.set_index("product")
+    total = 0.0
+    for p, q in plan.items():
+        if q is None:
+            continue
+        if p not in pid.index:
+            continue
+        total += float(q) * float(pid.loc[p, "price"])
+    return total
+
+
 def _max_uniform_scale_feasible(products_df: pd.DataFrame, resources_df: pd.DataFrame, bom_df: pd.DataFrame) -> float:
     """Largest s in [0, 1] such that producing s * max_demand for every SKU stays within resource caps."""
 
@@ -149,6 +162,24 @@ products_file = st.sidebar.file_uploader("products.csv", type=["csv"])
 resources_file = st.sidebar.file_uploader("resources.csv", type=["csv"])
 bom_file = st.sidebar.file_uploader("bom.csv", type=["csv"])
 
+st.sidebar.header("What-if (stress test)")
+cap_mult = st.sidebar.slider(
+    "Resource capacity ×",
+    min_value=0.5,
+    max_value=1.5,
+    value=1.0,
+    step=0.05,
+    help="Scales every resource availability before baseline + LP (scenario planning).",
+)
+cost_mult = st.sidebar.slider(
+    "Resource unit cost ×",
+    min_value=0.5,
+    max_value=1.5,
+    value=1.0,
+    step=0.05,
+    help="Scales procurement $/unit for every resource (cost inflation / deflation scenario).",
+)
+
 st.sidebar.header("Solver")
 integer_vars = st.sidebar.checkbox("Integer production quantities", value=False)
 time_limit = st.sidebar.number_input("Time limit (seconds, 0 = default)", min_value=0, max_value=600, value=0, step=5)
@@ -177,14 +208,49 @@ if products_df is None or resources_df is None or bom_df is None:
 ceiling_revenue = float((products_df["max_demand"] * products_df["price"]).sum())
 n_bom = len(bom_df)
 
-# --- Structural KPI row (always visible) ---
+# Stressed resources (same LP + baseline accounting)
+resources_work = resources_df.copy()
+resources_work["available"] = (resources_work["available"] * cap_mult).astype(float)
+resources_work["unit_cost"] = (resources_work["unit_cost"] * cost_mult).astype(float)
+
+# Baseline push scenario (scaled max-demand mix) — computed before solve for KPI deltas
+baseline_scale = _max_uniform_scale_feasible(products_df, resources_work, bom_df)
+baseline_plan = _baseline_uniform_max_plan(products_df, resources_work, bom_df, baseline_scale)
+baseline_material = _total_material_cost(baseline_plan, bom_df, resources_work)
+baseline_revenue = _total_revenue_from_plan(baseline_plan, products_df)
+baseline_profit = baseline_revenue - baseline_material
+
+total_demand_units = float(products_df["max_demand"].sum())
+total_capacity_units = float(resources_work["available"].sum())
+
+# --- Executive scale KPIs (always visible) ---
 s1, s2, s3, s4 = st.columns(4)
-s1.metric("SKU count", f"{len(products_df):,}")
-s2.metric("Resource types", f"{len(resources_df):,}")
-s3.metric("BOM lines", f"{n_bom:,}")
+s1.metric(
+    "Total demand (max)",
+    f"{total_demand_units:,.0f}",
+    delta=f"{len(products_df)} SKUs",
+    delta_color="off",
+    help="Sum of max_demand — scale of requested throughput.",
+)
+s2.metric(
+    "Total capacity (Σ avail.)",
+    f"{total_capacity_units:,.0f}",
+    delta=f"×{cap_mult:.2f} capacity slider",
+    delta_color="off",
+    help="Sum of resource availability after the capacity multiplier.",
+)
+s3.metric(
+    "Baseline material (ref.)",
+    f"${baseline_material:,.0f}",
+    delta=f"push @ {baseline_scale:.0%} of max",
+    delta_color="off",
+    help="Material $ for uniform max-demand mix scaled to feasibility — anchor for savings deltas after solve.",
+)
 s4.metric(
     "Demand-ceiling revenue",
     f"${ceiling_revenue:,.0f}",
+    delta=f"{n_bom} BOM lines",
+    delta_color="off",
     help="Σ(max_demand × price) — upper bound if capacity were unlimited.",
 )
 
@@ -197,8 +263,9 @@ with c1:
     st.markdown("**Products**")
     st.dataframe(products_df, use_container_width=True, height=220)
 with c2:
-    st.markdown("**Resources**")
-    st.dataframe(resources_df.reset_index(), use_container_width=True, height=220)
+    st.markdown("**Resources (after what-if multipliers)**")
+    st.caption(f"Capacity ×{cap_mult:.2f} · Unit cost ×{cost_mult:.2f} — used for baseline + optimization.")
+    st.dataframe(resources_work.reset_index(), use_container_width=True, height=220)
 with c3:
     st.markdown("**Bill of materials**")
     st.dataframe(bom_df, use_container_width=True, height=220)
@@ -216,6 +283,26 @@ st.download_button(
     file_name="inputs_snapshot.json",
     mime="application/json",
 )
+
+with st.expander("Objective & constraints (algorithm audit)", expanded=False):
+    st.markdown(
+        """
+**Decision variables**  
+- `q_i` = production quantity for SKU *i*, bounded by `min_demand_i ≤ q_i ≤ max_demand_i`.
+
+**Objective (maximize)**  
+- Sum of `price_i × q_i` **minus** total procurement spend: for each resource *r*,  
+  `unit_cost_r × (sum over i of q_i × BOM[i,r])`.  
+  i.e. **revenue minus material cost**.
+
+**Constraints**  
+- Each resource *r*: total consumption from the BOM **≤** `available_r` (after your **capacity ×** slider).  
+- `BOM[i,r]` = units of resource *r* required per unit of product *i*.
+
+**Baseline reference (for savings deltas)**  
+- “Push” scenario: produce `s × max_demand_i` for every SKU, using the **largest** `s` in `[0, 1]` that keeps all resource constraints feasible; material $ uses the same **unit cost ×** multipliers as the LP.
+        """
+    )
 
 with st.expander("Technical methodology & assumptions"):
     st.markdown(
@@ -238,7 +325,7 @@ if not run_opt:
 with st.spinner("Solving linear program…"):
     sol = solve_production_plan(
         products_df,
-        resources_df,
+        resources_work,
         bom_df,
         integer=integer_vars,
         time_limit=(int(time_limit) if time_limit > 0 else None),
@@ -266,7 +353,7 @@ res_usage_df = pd.DataFrame(
         {
             "resource": r,
             "used": sol["resource_usage"][r],
-            "available": float(resources_df.loc[r, "available"]),
+            "available": float(resources_work.loc[r, "available"]),
             "utilization_%": sol["resource_utilization_pct"][r],
         }
         for r in sol["resource_usage"].keys()
@@ -274,13 +361,21 @@ res_usage_df = pd.DataFrame(
 ).sort_values("utilization_%", ascending=False)
 avg_util = float(res_usage_df["utilization_%"].mean()) if len(res_usage_df) else 0.0
 
+if baseline_material > 1e-9:
+    cost_reduction_pct = (baseline_material - mat_cost) / baseline_material * 100.0
+else:
+    cost_reduction_pct = 0.0
+saved_usd = baseline_material - mat_cost
+profit_vs_baseline = profit - baseline_profit
+
 k1, k2, k3, k4 = st.columns(4)
 with k1:
     st.metric(
         "Predicted profit",
         f"${profit:,.2f}",
-        delta=f"{margin_pct:.1f}% margin",
-        help="Revenue minus material cost at optimal quantities.",
+        delta=f"{margin_pct:.1f}% margin · Δ ${profit_vs_baseline:+,.0f} vs baseline push",
+        delta_color="normal" if profit_vs_baseline > 1 else ("inverse" if profit_vs_baseline < -1 else "off"),
+        help="LP optimum vs the same-stress reference plan (scaled max-demand mix).",
     )
 with k2:
     st.metric(
@@ -290,7 +385,21 @@ with k2:
         help="Realized revenue vs Σ(max_demand × price).",
     )
 with k3:
-    st.metric("Material cost", f"${mat_cost:,.2f}", delta_color="inverse")
+    st.metric(
+        "Material cost (optimized)",
+        f"${mat_cost:,.2f}",
+        delta=(
+            f"{cost_reduction_pct:.1f}% vs baseline (−${saved_usd:,.0f})"
+            if saved_usd > 0.01
+            else (
+                f"+{-cost_reduction_pct:.1f}% vs baseline (+${-saved_usd:,.0f})"
+                if saved_usd < -0.01
+                else "Flat vs baseline"
+            )
+        ),
+        delta_color="normal" if saved_usd > 0.01 else ("inverse" if saved_usd < -0.01 else "off"),
+        help="Green when optimized procurement is below the scaled max-demand baseline.",
+    )
 with k4:
     st.metric(
         "Avg resource utilization",
@@ -300,14 +409,6 @@ with k4:
     )
 
 # --- Scenario comparison: baseline vs optimized material spend ---
-baseline_scale = _max_uniform_scale_feasible(products_df, resources_df, bom_df)
-baseline_plan = _baseline_uniform_max_plan(products_df, resources_df, bom_df, baseline_scale)
-baseline_material = _total_material_cost(baseline_plan, bom_df, resources_df)
-if baseline_material > 1e-9:
-    cost_reduction_pct = (baseline_material - mat_cost) / baseline_material * 100.0
-else:
-    cost_reduction_pct = 0.0
-saved_usd = baseline_material - mat_cost
 
 st.subheader("Scenario comparison — material spend")
 st.caption(
@@ -409,6 +510,27 @@ st.download_button(
     mime="text/csv",
     help="One file: KPI snapshot, plan comparison (baseline vs optimized qty), and utilization for audit.",
 )
+
+fig_cost = go.Figure()
+fig_cost.add_trace(
+    go.Bar(
+        x=["Baseline push (material)", "Optimized LP (material)"],
+        y=[baseline_material, mat_cost],
+        marker_color=["#64748b", "#0052CC"],
+        text=[f"${baseline_material:,.0f}", f"${mat_cost:,.0f}"],
+        textposition="outside",
+        textfont=dict(size=13, color="#253858"),
+    )
+)
+fig_cost.update_layout(
+    title="Cost story — procurement spend vs baseline reference",
+    yaxis_title="USD",
+    xaxis=dict(tickangle=0, tickfont=dict(size=13, color="#253858")),
+    template="plotly_white",
+    height=380,
+    showlegend=False,
+)
+st.plotly_chart(fig_cost, use_container_width=True)
 
 fig1 = go.Figure()
 fig1.add_trace(go.Bar(x=plan_df["product"], y=plan_df["quantity"], marker_color="#0052CC", name="Units"))
