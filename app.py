@@ -24,6 +24,18 @@ _TRUST_CSS = """
     div[data-testid="stMetricValue"] { font-size: 1.45rem; font-weight: 600; color: #253858; }
     h1 { color: #0052CC !important; font-weight: 700 !important; }
     h2, h3 { color: #253858 !important; }
+    .pp-insight-box {
+        border-radius: 12px;
+        padding: 20px 22px;
+        margin: 14px 0 20px 0;
+        border: 1px solid #e2e8f0;
+        background: #f8fafc;
+        border-left-width: 5px;
+        border-left-style: solid;
+    }
+    .pp-insight-kicker { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; }
+    .pp-insight-lead { color: #253858; font-size: 1.2rem; font-weight: 800; line-height: 1.35; margin: 10px 0 12px 0; }
+    .pp-insight-body { color: #334155; font-size: 0.98rem; line-height: 1.55; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
@@ -460,8 +472,7 @@ else:
         "when revenue upside justifies higher input use — review BOM costs and margins by SKU."
     )
 
-plan_compare = plan_df.copy()
-plan_compare = plan_compare.rename(columns={"quantity": "optimized_qty"})
+plan_compare = plan_df.copy().rename(columns={"quantity": "optimized_qty"})
 plan_compare["baseline_qty"] = plan_compare["product"].map(baseline_plan).astype(float)
 plan_compare["qty_delta_vs_baseline"] = plan_compare["optimized_qty"] - plan_compare["baseline_qty"]
 
@@ -531,6 +542,81 @@ fig_cost.update_layout(
     showlegend=False,
 )
 st.plotly_chart(fig_cost, use_container_width=True)
+
+# --- Executive insight & recommendation (after cost evidence) ---
+shift_idx = plan_compare["qty_delta_vs_baseline"].abs().idxmax()
+shift_row = plan_compare.loc[shift_idx]
+shift_prod = str(shift_row["product"])
+shift_delta = float(shift_row["qty_delta_vs_baseline"])
+
+top_res = res_usage_df.iloc[0]["resource"] if len(res_usage_df) else "—"
+top_util = float(res_usage_df.iloc[0]["utilization_%"]) if len(res_usage_df) else 0.0
+
+if saved_usd > 1.0 and profit_vs_baseline > 1.0:
+    narrative_accent = "#0d9488"
+    insight_lead = (
+        f"<strong>Approve the optimized mix</strong> — it beats the scaled max-demand baseline on both "
+        f"<strong>profit (+${profit_vs_baseline:,.0f})</strong> and "
+        f"<strong>procurement (−${saved_usd:,.0f}, {cost_reduction_pct:.1f}%)</strong> under your current stress test."
+    )
+    insight_body = (
+        f"<strong>Recommendation:</strong> socialize this plan with Ops + Finance using the "
+        "<strong>Executive review CSV</strong>. Next: lock assumptions on capacity × "
+        f"{cap_mult:.2f} and cost × {cost_mult:.2f}, then schedule a follow‑up run if demand or vendor rates move.<br><br>"
+        f"<strong>Bottleneck watch:</strong> <strong>{top_res}</strong> is at <strong>{top_util:.1f}%</strong> utilization — "
+        "any supply shock there binds first.<br><br>"
+        f"<strong>Mix shift:</strong> largest move vs baseline is <strong>{shift_prod}</strong> "
+        f"(<strong>{shift_delta:+,.0f}</strong> units) — confirm changeovers and MOQs before rollout."
+    )
+elif saved_usd > 1.0:
+    narrative_accent = "#0052CC"
+    insight_lead = (
+        f"<strong>Procurement-led win</strong> — material spend is down <strong>${saved_usd:,.0f}</strong> "
+        f"(<strong>{cost_reduction_pct:.1f}%</strong> vs baseline) even if headline profit vs baseline is modest."
+    )
+    insight_body = (
+        "<strong>Recommendation:</strong> pair this view with SKU margin checks so savings are not masking "
+        "revenue left on the table. Export the <strong>Executive review CSV</strong> for audit.<br><br>"
+        f"<strong>Capacity story:</strong> tightest resource remains <strong>{top_res}</strong> at "
+        f"<strong>{top_util:.1f}%</strong> — if you relax capacity ×, re‑run to see shadow price relief."
+    )
+elif profit_vs_baseline > 1.0 and saved_usd < -1.0:
+    narrative_accent = "#0052CC"
+    insight_lead = (
+        "<strong>Revenue-first plan</strong> — the LP spends more on inputs than the naive baseline because "
+        f"it buys <strong>+${-saved_usd:,.0f}</strong> of margin‑accretive volume (profit vs baseline "
+        f"<strong>+${profit_vs_baseline:,.0f}</strong>)."
+    )
+    insight_body = (
+        "<strong>Recommendation:</strong> treat this as a <strong>growth / mix</strong> decision, not a cost‑cut "
+        "story. Validate service levels and supplier payment terms before committing.<br><br>"
+        f"<strong>Watch:</strong> <strong>{top_res}</strong> @ <strong>{top_util:.1f}%</strong>; "
+        f"largest quantity swing: <strong>{shift_prod}</strong> (<strong>{shift_delta:+,.0f}</strong> units vs baseline)."
+    )
+else:
+    narrative_accent = "#64748b"
+    insight_lead = (
+        "<strong>Neutral / marginal trade</strong> — vs the baseline push, the LP does not deliver a large "
+        "separable win on procurement or profit at the current stress settings."
+    )
+    insight_body = (
+        "<strong>Recommendation:</strong> widen what‑if ranges, revisit <strong>prices / BOM</strong>, or "
+        "tighten min–max demand bands so the model has more room to separate scenarios. "
+        "Always attach the <strong>Executive review CSV</strong> when escalating.<br><br>"
+        f"<strong>Diagnostics:</strong> mean utilization <strong>{avg_util:.1f}%</strong>; "
+        f"highest binding resource <strong>{top_res}</strong> (<strong>{top_util:.1f}%</strong>)."
+    )
+
+st.markdown(
+    f"""
+<div class="pp-insight-box" style="border-left-color:{narrative_accent};">
+  <div class="pp-insight-kicker" style="color:{narrative_accent};">Executive insight</div>
+  <div class="pp-insight-lead">{insight_lead}</div>
+  <div class="pp-insight-body">{insight_body}</div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
 fig1 = go.Figure()
 fig1.add_trace(go.Bar(x=plan_df["product"], y=plan_df["quantity"], marker_color="#0052CC", name="Units"))
