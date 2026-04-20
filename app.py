@@ -487,8 +487,19 @@ def compute_naive_greedy_high_cost_bias_plan(
 
 
 # --- Sidebar ---
-st.sidebar.header("Data")
-with st.sidebar.expander("Built-in sample or your 3 CSVs", expanded=False):
+with st.sidebar.expander("How to use this app", expanded=False):
+    st.markdown(
+        "1. Under **Upload data / Use Sample**, open the panel and pick the **bundled sample** or upload **products**, **resources**, "
+        "and **BOM** (recipes); use the **ZIP** if you need a blank template.\n"
+        "2. Use **What-if** sliders to stress limits and input prices.\n"
+        "3. Click **Run optimization** (sidebar or main) — sample mode auto-runs once per session.\n"
+        "4. Read **Overview** for the headline, **Compare scenarios** for contrasts, **Charts** for visuals, "
+        "**Tables & downloads** for CSV/JSON.\n"
+        "5. Optional: under **Charts**, open **Which limit pays off to loosen?** (clearest with **Whole-number production units** unchecked)."
+    )
+
+st.sidebar.header("Upload data / Use Sample")
+with st.sidebar.expander("Products, resources & BOM", expanded=False):
     st.caption("Turn off the sample to upload **products**, **resources**, and **BOM** (recipe) files.")
     use_sample = st.checkbox("Use bundled sample CSVs in `/data`", value=True)
 
@@ -527,16 +538,6 @@ integer_vars = st.sidebar.checkbox("Whole-number production units (rounding)", v
 time_limit = st.sidebar.number_input("Time limit (seconds, 0 = default)", min_value=0, max_value=600, value=0, step=5)
 
 run_opt_sidebar = st.sidebar.button("Run optimization", type="primary", use_container_width=True)
-
-with st.sidebar.expander("How to use this app", expanded=False):
-    st.markdown(
-        "1. Open **Data → Built-in sample or your 3 CSVs** for the sample toggle, uploads, and ZIP template.\n"
-        "2. Adjust **capacity ×** and **cost ×** for what-if scenarios.\n"
-        "3. Click **Run optimization** (sidebar or main) — sample mode auto-runs once per session.\n"
-        "4. Read **Overview** for the headline, **Compare scenarios** for contrasts, **Charts** for visuals, "
-        "**Tables & downloads** for CSV/JSON.\n"
-        "5. Optional: under **Charts**, open **Which limit pays off to loosen?** (clearest with **Whole-number production units** unchecked)."
-    )
 
 st.sidebar.divider()
 st.sidebar.subheader("About")
