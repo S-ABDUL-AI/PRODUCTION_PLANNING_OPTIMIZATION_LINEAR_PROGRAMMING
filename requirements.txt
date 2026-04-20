@@ -3,5 +3,3 @@ pandas>=2.0.0
 numpy>=1.23.0
 plotly>=5.18.0
 pulp>=2.7.0
-# Optional: only if model.py (or other modules) import matplotlib — prefer Plotly in app.py only.
-matplotlib>=3.7.0

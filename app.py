@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import tempfile
+import zipfile
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -36,10 +38,14 @@ _TRUST_CSS = """
     .pp-insight-kicker { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; }
     .pp-insight-lead { color: #253858; font-size: 1.2rem; font-weight: 800; line-height: 1.35; margin: 10px 0 12px 0; }
     .pp-insight-body { color: #334155; font-size: 0.98rem; line-height: 1.55; }
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    [data-testid="stToolbar"] {visibility: hidden;}
+    .pp-hero {
+        border-radius: 14px;
+        border: 1px solid #bfdbfe;
+        background: linear-gradient(90deg, #eff6ff 0%, #f8fafc 100%);
+        padding: 14px 16px;
+        color: #0f172a;
+        margin-bottom: 12px;
+    }
 </style>
 """
 st.markdown(_TRUST_CSS, unsafe_allow_html=True)
@@ -85,11 +91,47 @@ def cached_load_sample():
 
 
 def get_dfs(use_sample, products_file, resources_file, bom_file):
+    """Return (products_df, resources_df, bom_df, error_message). error_message is None on success."""
     if use_sample:
-        return cached_load_sample()
+        try:
+            return (*cached_load_sample(), None)
+        except Exception as exc:
+            return None, None, None, f"Could not load bundled sample data: {exc}"
     if not products_file or not resources_file or not bom_file:
-        return None, None, None
-    return load_data(products_file, resources_file, bom_file)
+        return None, None, None, "Upload all three CSV files (products, resources, BOM), or enable bundled sample data."
+    try:
+        for handle in (products_file, resources_file, bom_file):
+            if hasattr(handle, "seek"):
+                handle.seek(0)
+        products = pd.read_csv(products_file)
+        resources = pd.read_csv(resources_file)
+        bom = pd.read_csv(bom_file)
+        return (*load_data_from_frames(products, resources, bom), None)
+    except ValueError as exc:
+        return None, None, None, str(exc)
+    except Exception as exc:
+        return None, None, None, f"Could not read uploaded CSVs: {exc}"
+
+
+def load_data_from_frames(products: pd.DataFrame, resources: pd.DataFrame, bom: pd.DataFrame):
+    """Validate and normalize uploaded frames using the same rules as model.load_data."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pp = os.path.join(tmpdir, "products.csv")
+        rr = os.path.join(tmpdir, "resources.csv")
+        bb = os.path.join(tmpdir, "bom.csv")
+        products.to_csv(pp, index=False)
+        resources.to_csv(rr, index=False)
+        bom.to_csv(bb, index=False)
+        return load_data(pp, rr, bb)
+
+
+def build_csv_template_zip_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("products.csv", sample_products)
+        zf.writestr("resources.csv", sample_resources)
+        zf.writestr("bom.csv", sample_bom)
+    return buf.getvalue()
 
 
 def _total_material_cost(plan: dict, bom_df: pd.DataFrame, resources_df: pd.DataFrame) -> float:
@@ -299,12 +341,6 @@ def compute_naive_greedy_high_cost_bias_plan(
     }
 
 
-st.title("Production Planning — LP Optimization Console")
-st.caption(
-    "Maximize profit subject to BOM and resource constraints. "
-    "All inputs and the **Run optimization** control are in the sidebar."
-)
-
 # --- Sidebar ---
 st.sidebar.header("Data")
 use_sample = st.sidebar.checkbox("Use bundled sample CSVs in `/data`", value=True)
@@ -312,6 +348,13 @@ use_sample = st.sidebar.checkbox("Use bundled sample CSVs in `/data`", value=Tru
 products_file = st.sidebar.file_uploader("products.csv", type=["csv"])
 resources_file = st.sidebar.file_uploader("resources.csv", type=["csv"])
 bom_file = st.sidebar.file_uploader("bom.csv", type=["csv"])
+st.sidebar.download_button(
+    "Download CSV template pack (ZIP)",
+    data=build_csv_template_zip_bytes(),
+    file_name="production_planning_template.zip",
+    mime="application/zip",
+    help="products.csv, resources.csv, and bom.csv with the expected columns.",
+)
 
 st.sidebar.header("What-if (stress test)")
 cap_mult = st.sidebar.slider(
@@ -335,7 +378,16 @@ st.sidebar.header("Solver")
 integer_vars = st.sidebar.checkbox("Integer production quantities", value=False)
 time_limit = st.sidebar.number_input("Time limit (seconds, 0 = default)", min_value=0, max_value=600, value=0, step=5)
 
-run_opt = st.sidebar.button("Run optimization", type="primary", use_container_width=True)
+run_opt_sidebar = st.sidebar.button("Run optimization", type="primary", use_container_width=True)
+
+with st.sidebar.expander("How to use this app", expanded=False):
+    st.markdown(
+        "1. Use **bundled sample** data or upload three CSVs (see ZIP template).\n"
+        "2. Adjust **capacity ×** and **cost ×** for what-if scenarios.\n"
+        "3. Click **Run optimization** (sidebar or main) — sample mode auto-runs once per session.\n"
+        "4. Review executive KPIs, mix vs baseline, and exports.\n"
+        "5. Open **Sensitivity analysis** for shadow prices (continuous LP only)."
+    )
 
 st.sidebar.divider()
 st.sidebar.subheader("About")
@@ -350,11 +402,45 @@ AI Engineer · Data Scientist · Economist
 """
 )
 
-products_df, resources_df, bom_df = get_dfs(use_sample, products_file, resources_file, bom_file)
+products_df, resources_df, bom_df, load_err = get_dfs(use_sample, products_file, resources_file, bom_file)
 
-if products_df is None or resources_df is None or bom_df is None:
-    st.warning("Upload **products.csv**, **resources.csv**, and **bom.csv** in the sidebar, or use sample data.")
+if load_err:
+    st.error(load_err)
     st.stop()
+
+st.title("Production Planning — LP Optimization Console")
+st.caption(
+    "Decision support for S&OP and plant planning: maximize profit subject to BOM and resource constraints."
+)
+st.markdown(
+    "<div class='pp-hero'><strong>Challenge / problem statement:</strong> With limited materials and machine time, "
+    "choosing production quantities by instinct leaves margin on the table. This console runs a transparent LP, "
+    "compares baselines, and exports a board-ready snapshot.</div>",
+    unsafe_allow_html=True,
+)
+
+btn_a, btn_b, _sp = st.columns([1, 1, 3])
+with btn_a:
+    run_opt_main = st.button("Run optimization", type="primary", use_container_width=True)
+with btn_b:
+    st.download_button(
+        label="Template pack (ZIP)",
+        data=build_csv_template_zip_bytes(),
+        file_name="production_planning_template.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+if not use_sample:
+    st.session_state["_pp_autosolve_sample_done"] = False
+
+auto_run_sample = bool(
+    use_sample and not st.session_state.get("_pp_autosolve_sample_done", False)
+)
+if auto_run_sample:
+    st.session_state["_pp_autosolve_sample_done"] = True
+
+run_effective = bool(run_opt_sidebar or run_opt_main or auto_run_sample)
 
 ceiling_revenue = float((products_df["max_demand"] * products_df["price"]).sum())
 n_bom = len(bom_df)
@@ -374,7 +460,7 @@ baseline_profit = baseline_revenue - baseline_material
 naive_pack = compute_naive_greedy_high_cost_bias_plan(products_df, resources_work, bom_df)
 
 total_demand_units = float(products_df["max_demand"].sum())
-total_capacity_units = float(resources_work["available"].sum())
+n_resource_lanes = int(len(resources_work))
 
 # --- Executive scale KPIs (always visible) ---
 s1, s2, s3, s4 = st.columns(4)
@@ -386,11 +472,11 @@ s1.metric(
     help="Sum of max_demand — scale of requested throughput.",
 )
 s2.metric(
-    "Total capacity (Σ avail.)",
-    f"{total_capacity_units:,.0f}",
+    "Resource lanes",
+    f"{n_resource_lanes:,}",
     delta=f"×{cap_mult:.2f} capacity slider",
     delta_color="off",
-    help="Sum of resource availability after the capacity multiplier.",
+    help="Count of capacity rows. Each row uses its own unit (kg, hours, etc.); do not sum availability across different units.",
 )
 s3.metric(
     "Baseline material (ref.)",
@@ -428,7 +514,7 @@ st.download_button(
     data=json.dumps(
         {
             "products": products_df.to_csv(index=False),
-            "resources": resources_df.reset_index().to_csv(index=False),
+            "resources": resources_work.reset_index().to_csv(index=False),
             "bom": bom_df.to_csv(index=False),
         },
         indent=0,
@@ -470,9 +556,34 @@ with st.expander("Technical methodology & assumptions"):
 
 st.divider()
 
-st.subheader("Visual analysis")
-if not run_opt:
-    st.info("Configure the model in the sidebar, then click **Run optimization**.")
+# --- Pre-solve ministerial brief (uses baseline reference only) ---
+mb1, mb2, mb3 = st.columns(3)
+risk_txt = (
+    f"Demand push is capped at **{baseline_scale:.0%}** of max demand under current capacity ×{cap_mult:.2f} — "
+    "capacity binds before the full demand ceiling."
+    if baseline_scale < 0.999
+    else "Demand push reaches **100%** of max demand in the reference scenario — check binding resources after solve."
+)
+impl_txt = (
+    "Baseline reference material spend anchors procurement deltas after optimization. "
+    f"Reference mix material ≈ **${baseline_material:,.0f}**."
+)
+action_txt = "Click **Run optimization** (sidebar or above) to compute the profit-maximizing plan and bottleneck signals."
+with mb1:
+    st.markdown(f"**Risk**\n\n{risk_txt}")
+with mb2:
+    st.markdown(f"**Implication**\n\n{impl_txt}")
+with mb3:
+    st.markdown(f"**Action now**\n\n{action_txt}")
+
+st.divider()
+
+st.subheader("Optimization results")
+if not run_effective:
+    st.info(
+        "Configure inputs in the sidebar, then click **Run optimization** here or in the sidebar. "
+        "Bundled sample data runs automatically on first load."
+    )
     st.stop()
 
 with st.spinner("Solving linear program…"):
@@ -642,8 +753,8 @@ with c_sc_b:
 
 if 12 <= cost_reduction_pct <= 18:
     st.success(
-        f"**Executive headline:** material spend is down **~{cost_reduction_pct:.0f}%** vs the baseline "
-        "push scenario — in line with common **10–15%** procurement efficiency targets in briefing decks."
+        f"**Scenario headline (this run only):** material spend is down **~{cost_reduction_pct:.0f}%** vs the baseline "
+        "push scenario. Treat this as an illustration for discussion — not an industry benchmark."
     )
 elif cost_reduction_pct > 0:
     st.info(
