@@ -251,7 +251,8 @@ def render_input_parameters_expander(
     """Collapsed tables + JSON snapshot (same data passed to the solver)."""
     with st.expander("Input parameters", expanded=False):
         st.caption(
-            "Products, limits (after your sidebar sliders), and bill of materials—the same figures passed to the solver."
+            "The three tables the app reads: **products**, **limits** (after your sidebar multipliers), and **recipes** "
+            "(which inputs each product uses)."
         )
         t1, t2, t3 = st.columns(3)
         with t1:
@@ -261,7 +262,7 @@ def render_input_parameters_expander(
             st.markdown("**Limits**")
             st.dataframe(resources_work.reset_index(), use_container_width=True, height=200)
         with t3:
-            st.markdown("**Bill of materials**")
+            st.markdown("**Recipes (product → inputs)**")
             st.dataframe(bom_df, use_container_width=True, height=200)
         st.download_button(
             "Download input parameters (JSON snapshot)",
@@ -381,12 +382,12 @@ def build_shadow_price_dataframe(sol: dict, resources_work: pd.DataFrame) -> tup
     """
     if not sol.get("duals_valid", True):
         return None, (
-            "Shadow prices are reported for the **continuous LP relaxation**. "
-            "Turn off **Integer production quantities** in the sidebar to enable duals."
+            "These “extra profit per unit of room” numbers work best when **Whole-number production units (rounding)** is **unchecked** "
+            "in the sidebar."
         )
     sp = sol.get("shadow_prices") or {}
     if not sp:
-        return None, "Solver did not return shadow prices for this run (try continuous variables)."
+        return None, "No sensitivity table for this run—try unchecking **Whole-number production units (rounding)** and run again."
 
     rows = []
     for r in resources_work.index:
@@ -413,7 +414,7 @@ def build_shadow_price_dataframe(sol: dict, resources_work: pd.DataFrame) -> tup
     df["_pi_sort"] = df["Shadow price ($ / extra unit of capacity)"].fillna(0.0)
     df = df.sort_values("_pi_sort", ascending=False).drop(columns=["_pi_sort"])
     if df["Shadow price ($ / extra unit of capacity)"].isna().all():
-        return None, "Shadow prices were not exposed by CBC for this model instance."
+        return None, "Sensitivity numbers were not available for this run from the solver."
     return df, None
 
 
@@ -487,51 +488,54 @@ def compute_naive_greedy_high_cost_bias_plan(
 
 # --- Sidebar ---
 st.sidebar.header("Data")
-use_sample = st.sidebar.checkbox("Use bundled sample CSVs in `/data`", value=True)
+with st.sidebar.expander("Built-in sample or your 3 CSVs", expanded=False):
+    st.caption("Turn off the sample to upload **products**, **resources**, and **BOM** (recipe) files.")
+    use_sample = st.checkbox("Use bundled sample CSVs in `/data`", value=True)
 
-products_file = st.sidebar.file_uploader("products.csv", type=["csv"])
-resources_file = st.sidebar.file_uploader("resources.csv", type=["csv"])
-bom_file = st.sidebar.file_uploader("bom.csv", type=["csv"])
-st.sidebar.download_button(
-    "Download CSV template pack (ZIP)",
-    data=build_csv_template_zip_bytes(),
-    file_name="production_planning_template.zip",
-    mime="application/zip",
-    help="products.csv, resources.csv, and bom.csv with the expected columns.",
-)
+    products_file = st.file_uploader("products.csv", type=["csv"])
+    resources_file = st.file_uploader("resources.csv", type=["csv"])
+    bom_file = st.file_uploader("bom.csv", type=["csv"])
+    st.download_button(
+        "Download CSV template pack (ZIP)",
+        data=build_csv_template_zip_bytes(),
+        file_name="production_planning_template.zip",
+        mime="application/zip",
+        help="products.csv, resources.csv, and bom.csv with the expected columns.",
+        use_container_width=True,
+    )
 
 st.sidebar.header("What-if (stress test)")
 cap_mult = st.sidebar.slider(
-    "Resource capacity ×",
+    "How tight are limits?",
     min_value=0.5,
     max_value=1.5,
     value=1.0,
     step=0.05,
-    help="Scales every resource availability before baseline + LP (scenario planning).",
+    help="1.0 = use the capacities in your file. Lower = pretend everything is tighter (e.g. downtime); higher = more room.",
 )
 cost_mult = st.sidebar.slider(
-    "Resource unit cost ×",
+    "How expensive are inputs?",
     min_value=0.5,
     max_value=1.5,
     value=1.0,
     step=0.05,
-    help="Scales procurement $/unit for every resource (cost inflation / deflation scenario).",
+    help="1.0 = use the $/unit costs in your file. Move up or down to stress supplier price changes.",
 )
 
 st.sidebar.header("Solver")
-integer_vars = st.sidebar.checkbox("Integer production quantities", value=False)
+integer_vars = st.sidebar.checkbox("Whole-number production units (rounding)", value=False)
 time_limit = st.sidebar.number_input("Time limit (seconds, 0 = default)", min_value=0, max_value=600, value=0, step=5)
 
 run_opt_sidebar = st.sidebar.button("Run optimization", type="primary", use_container_width=True)
 
 with st.sidebar.expander("How to use this app", expanded=False):
     st.markdown(
-        "1. Use **bundled sample** data or upload three CSVs (see ZIP template).\n"
+        "1. Open **Data → Built-in sample or your 3 CSVs** for the sample toggle, uploads, and ZIP template.\n"
         "2. Adjust **capacity ×** and **cost ×** for what-if scenarios.\n"
         "3. Click **Run optimization** (sidebar or main) — sample mode auto-runs once per session.\n"
         "4. Read **Overview** for the headline, **Compare scenarios** for contrasts, **Charts** for visuals, "
         "**Tables & downloads** for CSV/JSON.\n"
-        "5. Optional: under **Charts**, open **Which limit pays off to loosen?** (clearest with integer production off)."
+        "5. Optional: under **Charts**, open **Which limit pays off to loosen?** (clearest with **Whole-number production units** unchecked)."
     )
 
 st.sidebar.divider()
@@ -595,8 +599,9 @@ n_bom_lines = int(len(bom_df))
 
 st.markdown("### Key numbers")
 st.caption(
-    f"{len(products_df)} products · {n_resource_lanes} limit rows (each row is its own unit). "
-    f"Sidebar stress: capacity ×{cap_mult:.2f}, input cost ×{cost_mult:.2f}."
+    f"**{len(products_df)} products** · **{n_resource_lanes} kinds of limits** in your file (each row is one thing—hours, kg, etc.—don’t add unlike units). "
+    f"**Stress test (sidebar):** limits are **×{cap_mult:.2f}** and input **prices** are **×{cost_mult:.2f}** compared with your CSV. "
+    "Later we use a **simple reference** (grow every product in step until something runs out) only to **compare numbers**, not as a real operating plan."
 )
 pk1, pk2, pk3, pk4 = st.columns(4)
 with pk1:
@@ -605,48 +610,48 @@ with pk1:
         f"{total_max_demand_units:,.0f}",
         delta=f"{len(products_df)} products",
         delta_color="off",
-        help="Sum of max demand across SKUs — scale of ‘if we could sell the cap’ volume.",
+        help="Add up each product’s “if we could sell the most” quantity—shows the size of the case.",
     )
 with pk2:
     st.metric(
-        "Limit rows tracked",
+        "Kinds of limits in file",
         f"{n_resource_lanes:,}",
-        delta=f"capacity ×{cap_mult:.2f}",
+        delta=f"limits ×{cap_mult:.2f}",
         delta_color="off",
-        help="Each row is one kind of limit (kg, hours, etc.); do not add across different units.",
+        help="One row per limit in your data (machine hours, material, etc.). Each uses its own unit.",
     )
 with pk3:
     st.metric(
-        "Reference input spend",
+        "Simple reference: input spend",
         f"${baseline_material:,.0f}",
-        delta=f"push @ {baseline_scale:.0%} of max",
+        delta=f"even growth stops ~{baseline_scale:.0%} of full demand",
         delta_color="off",
-        help="What a simple proportional ‘grow everything’ mix spends on inputs before optimization.",
+        help="If every product grew the same way until something ran out, this is about what you’d spend on bought inputs.",
     )
 with pk4:
     st.metric(
-        "Max possible sales ($)",
+        "Dream-team sales ($)",
         f"${ceiling_revenue:,.0f}",
-        delta=f"{n_bom_lines} recipe lines",
+        delta=f"{n_bom_lines} product–input links",
         delta_color="off",
-        help="Sum of max_demand × price — upper bound if capacity were unlimited.",
+        help="If you sold every SKU at its top quantity at list price, with no capacity problem—an upper bound, not a forecast.",
     )
 
 _risk_html = (
-    f"Demand push is capped at <strong>{baseline_scale:.0%}</strong> of max demand under current capacity "
-    f"<strong>×{cap_mult:.2f}</strong> — capacity binds before the full demand ceiling."
+    f"If every product grew in lockstep, you’d only get to about <strong>{baseline_scale:.0%}</strong> of full demand before "
+    f"a limit stops you (with limits at <strong>×{cap_mult:.2f}</strong> in the sidebar). Something runs out before you “max out” every line."
     if baseline_scale < 0.999
     else (
-        f"A simple proportional push can reach <strong>full</strong> max demand at capacity <strong>×{cap_mult:.2f}</strong> — "
-        "still run optimization for the profit-minded mix."
+        f"With limits at <strong>×{cap_mult:.2f}</strong>, that even-growth story could reach <strong>full</strong> max demand in this file—"
+        "still run optimization for the best-profit mix."
     )
 )
 _impl_html = (
-    f"Baseline reference material spend anchors procurement deltas after optimization. "
-    f"Reference mix material ≈ <strong>${baseline_material:,.0f}</strong>."
+    f"After you run, we compare to a simple **baseline spend on inputs** of about <strong>${baseline_material:,.0f}</strong> "
+    "(that even-growth story above)—so you can see whether the recommended plan spends more or less and still wins on profit."
 )
 _action_html = (
-    "Click <strong>Run optimization</strong> (sidebar or below) to compute the profit-maximizing plan and bottleneck signals."
+    "Click <strong>Run optimization</strong> (sidebar or below) to get the best-profit mix and see **which limit is tightest**."
 )
 
 st.subheader("Recommendations")
@@ -801,22 +806,22 @@ st.markdown(
     <div class="pp-snapshot-cell">
       <div class="pp-snapshot-label">Profit</div>
       <div class="pp-snapshot-value">${profit:,.0f}</div>
-      <p class="pp-snapshot-sub">{margin_pct:.1f}% margin · <strong>${profit_vs_baseline:+,.0f}</strong> vs simple reference profit</p>
+      <p class="pp-snapshot-sub">{margin_pct:.1f}% margin · <strong>${profit_vs_baseline:+,.0f}</strong> vs the simple even-growth story’s profit</p>
     </div>
     <div class="pp-snapshot-cell">
       <div class="pp-snapshot-label">Sales</div>
       <div class="pp-snapshot-value">${revenue:,.0f}</div>
-      <p class="pp-snapshot-sub">About <strong>{ceiling_capture:.0f}%</strong> of a “sell everything at max demand” ceiling (~<strong>${ceiling_revenue:,.0f}</strong>).</p>
+      <p class="pp-snapshot-sub">About <strong>{ceiling_capture:.0f}%</strong> of “<strong>every</strong> product at max demand at list price” (~<strong>${ceiling_revenue:,.0f}</strong>)—a ceiling, not a forecast.</p>
     </div>
     <div class="pp-snapshot-cell">
       <div class="pp-snapshot-label">Purchased inputs</div>
       <div class="pp-snapshot-value">${mat_cost:,.0f}</div>
-      <p class="pp-snapshot-sub">Reference mix spent ~<strong>${baseline_material:,.0f}</strong>. {_inp_vs_ref_txt}</p>
+      <p class="pp-snapshot-sub">That simple story would spend ~<strong>${baseline_material:,.0f}</strong> on inputs. {_inp_vs_ref_txt}</p>
     </div>
     <div class="pp-snapshot-cell">
       <div class="pp-snapshot-label">Tightest limit</div>
       <div class="pp-snapshot-value">{_esc_res}</div>
-      <p class="pp-snapshot-sub">About <strong>{_top_util_pct:.0f}%</strong> of what you allowed · avg across rows <strong>{avg_util:.0f}%</strong></p>
+      <p class="pp-snapshot-sub">Using about <strong>{_top_util_pct:.0f}%</strong> of what you allowed for that line · simple average across lines <strong>{avg_util:.0f}%</strong> (mixed units—rough health check only)</p>
     </div>
   </div>
   <div class="pp-snapshot-foot">{_foot_greedy}</div>
@@ -834,7 +839,7 @@ with tab_overview:
         st.markdown(
             """
 The app chooses **how many units** of each product to make within your **minimum and maximum** demand bands.  
-It **adds up sales** from your prices, **subtracts** what you pay for each input line in the bill of materials, and picks the mix that **maximizes that profit** while **staying under** each limit row (after your capacity and cost sliders).
+It **adds up sales** from your prices, **subtracts** what you pay for each bought input in your recipe table, and picks the mix that **maximizes profit** while **staying under** each limit in your file (after the sidebar stress sliders).
 
 The **simple reference plan** is only a storytelling anchor: grow every SKU in the same pattern until something runs out. The **recommended plan** is the profit-minded answer on the same numbers.
             """
@@ -851,7 +856,7 @@ The **simple reference plan** is only a storytelling anchor: grow every SKU in t
 
 **Reference mix** — proportional max-demand push scaled by the largest factor in `[0,1]` that keeps the mix feasible; material $ uses the same unit-cost multipliers.
 
-**Shadow prices (“duals”)** — for a **continuous** LP, the reported value is the approximate **extra optimal profit** from **one more unit** of that limit’s capacity; **~0** usually means slack. See **Charts → Which limit pays off to loosen?** after solving.
+**Shadow prices (“duals”)** — for a **continuous** run, roughly **extra profit** from **one more unit** of that limit; **~0** usually means spare room. See **Charts → Which limit pays off to loosen?** after solving.
             """
         )
 
@@ -871,7 +876,7 @@ The **simple reference plan** is only a storytelling anchor: grow every SKU in t
         )
         insight_body = (
             f"<strong>What to do next:</strong> walk this through ops and finance using the <strong>Tables & downloads</strong> tab. "
-            f"Lock in assumptions for capacity ×{cap_mult:.2f} and cost ×{cost_mult:.2f}, then re-run if demand or supplier prices move.<br><br>"
+            f"Lock in the sidebar stress settings (limits ×{cap_mult:.2f}, prices ×{cost_mult:.2f}), then re-run if demand or supplier prices move.<br><br>"
             f"<strong>Where it gets tight first:</strong> <strong>{top_res}</strong> is running at about <strong>{top_util:.0f}%</strong> of what you allowed—"
             "any slip there hits the plan fastest.<br><br>"
             f"<strong>Biggest quantity swing vs the reference:</strong> <strong>{shift_prod}</strong> "
@@ -887,7 +892,7 @@ The **simple reference plan** is only a storytelling anchor: grow every SKU in t
             "<strong>What to do next:</strong> double-check margins by product so cheaper inputs are not hiding weaker sales. "
             "Use the export bundle under <strong>Tables & downloads</strong> for a paper trail.<br><br>"
             f"<strong>Capacity:</strong> the tightest line is still <strong>{top_res}</strong> at about <strong>{top_util:.0f}%</strong>—"
-            "try relaxing the capacity slider and re-running to see how much room opens up."
+            "try moving the **How tight are limits?** slider up and re-running to see how much room opens up."
         )
     elif profit_vs_baseline > 1.0 and saved_usd < -1.0:
         narrative_accent = "#0052CC"
@@ -911,8 +916,8 @@ The **simple reference plan** is only a storytelling anchor: grow every SKU in t
         insight_body = (
             "<strong>What to do next:</strong> widen the what-if sliders, revisit prices or recipes, or tighten min/max demand bands "
             "so the case has more room to breathe. Attach the CSV bundle from <strong>Tables & downloads</strong> if you escalate.<br><br>"
-            f"<strong>Pulse check:</strong> average limit use about <strong>{avg_util:.0f}%</strong>; "
-            f"busiest single line <strong>{top_res}</strong> at about <strong>{top_util:.0f}%</strong>."
+            f"<strong>Pulse check:</strong> simple average use across limit lines about <strong>{avg_util:.0f}%</strong>; "
+            f"busiest line <strong>{top_res}</strong> at about <strong>{top_util:.0f}%</strong>."
         )
 
     st.markdown(
@@ -1114,7 +1119,7 @@ fig2.update_layout(
 
 with tab_charts:
     st.caption(
-        "Visual readout for the same run: money on inputs, recommended volumes, and how hard each limit row is working."
+        "Visual readout for the same run: money on inputs, recommended volumes, and how hard each limit from your file is working."
     )
     st.plotly_chart(fig_cost, use_container_width=True)
     st.plotly_chart(fig1, use_container_width=True)
@@ -1139,11 +1144,11 @@ with tab_charts:
     with st.expander("Which limit pays off to loosen? (advanced)", expanded=False):
         st.markdown(
             """
-For each **limit row**, the table estimates how much **extra profit** you would get from **one more unit** of that limit’s
-capacity—**if nothing else changed**. A **higher dollar value** usually means that line is a sharper pinch point on the margin.
+For each **limit from your file**, the table estimates how much **extra profit** you might get from **one more unit** of room there—
+**if nothing else changed**. A **higher dollar value** usually means easing that limit pays off more on the margin.
 **Near zero** often means you still have slack there.
 
-Clearest when **integer production** is turned **off** in the sidebar (continuous case).
+Clearest when **Whole-number production units (rounding)** is **unchecked** in the sidebar.
             """
         )
         sh_df, sh_msg = build_shadow_price_dataframe(sol, resources_work)
